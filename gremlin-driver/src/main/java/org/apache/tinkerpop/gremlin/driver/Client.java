@@ -18,7 +18,9 @@
  */
 package org.apache.tinkerpop.gremlin.driver;
 
-import org.apache.tinkerpop.gremlin.driver.exception.ConnectionException;
+import org.apache.commons.lang3.exception.ExceptionUtils;
+import org.apache.tinkerpop.gremlin.driver.exception.HostUnavailableException;
+import org.apache.tinkerpop.gremlin.driver.exception.NoAvailableHostException;
 import org.apache.tinkerpop.gremlin.driver.message.RequestMessage;
 import org.apache.tinkerpop.gremlin.process.traversal.Bytecode;
 import org.apache.tinkerpop.gremlin.process.traversal.Traversal;
@@ -40,8 +42,8 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 /**
@@ -83,7 +85,7 @@ public abstract class Client {
     /**
      * Chooses a {@link Connection} to write the message to.
      */
-    protected abstract Connection chooseConnection(final RequestMessage msg) throws TimeoutException, ConnectionException;
+    protected abstract CompletableFuture<Connection> chooseConnection(final RequestMessage msg);
 
     /**
      * Asynchronous close of the {@code Client}.
@@ -359,24 +361,19 @@ public abstract class Client {
             init();
 
         final CompletableFuture<ResultSet> future = new CompletableFuture<>();
-        Connection connection = null;
-        try {
-            // the connection is returned to the pool once the response has been completed...see Connection.write()
-            // the connection may be returned to the pool with the host being marked as "unavailable"
-            connection = chooseConnection(msg);
-            connection.write(msg, future);
-            return future;
-        } catch (TimeoutException toe) {
-            // there was a timeout borrowing a connection
-            throw new RuntimeException(toe);
-        } catch (ConnectionException ce) {
-            throw new RuntimeException(ce);
-        } catch (Exception ex) {
-            throw new RuntimeException(ex);
-        } finally {
-            if (logger.isDebugEnabled())
+        // the connection is returned to the pool once the response has been completed...see Connection.write()
+        // the connection may be returned to the pool with the host being marked as "unavailable"
+        chooseConnection(msg).whenComplete((connection, error) -> {
+            if (logger.isDebugEnabled()) {
                 logger.debug("Submitted {} to - {}", msg, null == connection ? "connection not initialized" : connection.toString());
-        }
+            }
+            if (error == null) {
+                connection.write(msg, future);
+            } else {
+                future.completeExceptionally(error);
+            }
+        });
+        return future;
     }
 
     public abstract boolean isClosing();
@@ -478,7 +475,7 @@ public abstract class Client {
          * from that host's connection pool.
          */
         @Override
-        protected Connection chooseConnection(final RequestMessage msg) throws TimeoutException, ConnectionException {
+        protected CompletableFuture<Connection> chooseConnection(final RequestMessage msg) {
             final Iterator<Host> possibleHosts;
             if (msg.optionalArgs(Tokens.ARGS_HOST).isPresent()) {
                 // TODO: not sure what should be done if unavailable - select new host and re-submit traversal?
@@ -489,14 +486,32 @@ public abstract class Client {
                 possibleHosts = this.cluster.loadBalancingStrategy().select(msg);
             }
 
-            // you can get no possible hosts in more than a few situations. perhaps the servers are just all down.
-            // or perhaps the client is not configured properly (disables ssl when ssl is enabled on the server).
-            if (!possibleHosts.hasNext())
-                throw new TimeoutException("Timed out while waiting for an available host - check the client configuration and connectivity to the server if this message persists");
 
-            final Host bestHost = possibleHosts.next();
-            final ConnectionPool pool = hostConnectionPools.get(bestHost);
-            return pool.borrowConnection(cluster.connectionPoolSettings().maxWaitForConnection, TimeUnit.MILLISECONDS);
+            if (!possibleHosts.hasNext()) {
+                CompletableFuture<Connection> connection = new CompletableFuture<>();
+                connection.completeExceptionally(new NoAvailableHostException());
+                return connection;
+            }
+
+            final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(cluster.connectionPoolSettings().maxWaitForConnection);
+            return chooseConnection(possibleHosts, deadline);
+        }
+
+        private CompletableFuture<Connection> chooseConnection(final Iterator<Host> possibleHosts, final long deadline) {
+            final Host nextHost = possibleHosts.next();
+            final ConnectionPool pool = hostConnectionPools.get(nextHost);
+            return pool.borrowConnection(deadline)
+                    .handle((conn, err) -> {
+                        if (err == null) {
+                            return CompletableFuture.completedFuture(conn);
+                        }
+                        if (err instanceof HostUnavailableException && possibleHosts.hasNext()) {
+                            return chooseConnection(possibleHosts, deadline);
+                        } else {
+                            return ExceptionUtils.rethrow(err);
+                        }
+                    })
+                    .thenCompose(Function.identity());
         }
 
         /**
@@ -625,7 +640,7 @@ public abstract class Client {
          * Delegates to the underlying {@link Client.ClusteredClient}.
          */
         @Override
-        protected Connection chooseConnection(final RequestMessage msg) throws TimeoutException, ConnectionException {
+        protected CompletableFuture<Connection> chooseConnection(final RequestMessage msg) {
             if (close.isDone()) throw new IllegalStateException("Client is closed");
             return client.chooseConnection(msg);
         }
@@ -693,8 +708,9 @@ public abstract class Client {
          * Since the session is bound to a single host, simply borrow a connection from that pool.
          */
         @Override
-        protected Connection chooseConnection(final RequestMessage msg) throws TimeoutException, ConnectionException {
-            return connectionPool.borrowConnection(cluster.connectionPoolSettings().maxWaitForConnection, TimeUnit.MILLISECONDS);
+        protected CompletableFuture<Connection> chooseConnection(final RequestMessage msg) {
+            final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(cluster.connectionPoolSettings().maxWaitForConnection);
+            return connectionPool.borrowConnection(deadline);
         }
 
         /**

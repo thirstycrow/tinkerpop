@@ -54,4 +54,9 @@ public class ConnectionException extends Exception {
     public Optional<InetSocketAddress> getAddress() {
         return Optional.ofNullable(address);
     }
+
+    @Override
+    public synchronized Throwable fillInStackTrace() {
+        return this;
+    }
 }

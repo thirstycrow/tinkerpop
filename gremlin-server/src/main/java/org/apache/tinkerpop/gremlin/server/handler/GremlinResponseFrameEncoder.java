@@ -20,17 +20,17 @@ package org.apache.tinkerpop.gremlin.server.handler;
 
 import com.codahale.metrics.Meter;
 import org.apache.tinkerpop.gremlin.driver.MessageSerializer;
-import org.apache.tinkerpop.gremlin.driver.Tokens;
 import org.apache.tinkerpop.gremlin.driver.message.ResponseMessage;
 import org.apache.tinkerpop.gremlin.driver.message.ResponseStatusCode;
 import org.apache.tinkerpop.gremlin.driver.ser.MessageTextSerializer;
 import org.apache.tinkerpop.gremlin.server.GremlinServer;
 import org.apache.tinkerpop.gremlin.server.op.session.Session;
 import org.apache.tinkerpop.gremlin.server.util.ExceptionHelper;
-import org.apache.tinkerpop.gremlin.server.util.MetricManager;
+import org.apache.tinkerpop.gremlin.server.util.GremlinServerMetrics;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.MessageToMessageEncoder;
+import org.apache.tinkerpop.gremlin.util.MetricManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 

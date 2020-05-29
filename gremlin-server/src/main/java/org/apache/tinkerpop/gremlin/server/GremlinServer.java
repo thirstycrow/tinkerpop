@@ -36,10 +36,11 @@ import io.netty.util.internal.logging.Slf4JLoggerFactory;
 import org.apache.commons.lang3.SystemUtils;
 import org.apache.tinkerpop.gremlin.server.op.OpLoader;
 import org.apache.tinkerpop.gremlin.server.util.LifeCycleHook;
-import org.apache.tinkerpop.gremlin.server.util.MetricManager;
+import org.apache.tinkerpop.gremlin.server.util.GremlinServerMetrics;
 import org.apache.tinkerpop.gremlin.server.util.ServerGremlinExecutor;
 import org.apache.tinkerpop.gremlin.server.util.ThreadFactoryUtil;
 import org.apache.tinkerpop.gremlin.util.Gremlin;
+import org.apache.tinkerpop.gremlin.util.MetricManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 

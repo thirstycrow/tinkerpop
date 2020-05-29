@@ -18,17 +18,18 @@
  */
 package org.apache.tinkerpop.gremlin.driver;
 
-import io.netty.handler.codec.CodecException;
+import io.netty.channel.ChannelOption;
+import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.apache.tinkerpop.gremlin.driver.exception.ConnectionException;
 import org.apache.tinkerpop.gremlin.driver.message.RequestMessage;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelPromise;
 import io.netty.channel.socket.nio.NioSocketChannel;
+import org.apache.tinkerpop.gremlin.driver.util.FutureUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.IOException;
 import java.net.URI;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -51,7 +52,18 @@ import java.util.concurrent.atomic.AtomicReference;
 final class Connection {
     private static final Logger logger = LoggerFactory.getLogger(Connection.class);
 
-    private final Channel channel;
+    public static CompletableFuture<Connection> open(final URI uri, final ConnectionPool pool, final int maxInProcess) {
+        CompletableFuture<Connection> connectionFuture = new CompletableFuture<>();
+        if (pool.getCluster().isClosing()) {
+            connectionFuture.completeExceptionally(new IllegalStateException("Cannot open a connection with the cluster after close() is called"));
+        } else {
+            new Connection(uri, pool, maxInProcess, connectionFuture);
+        }
+        return connectionFuture;
+    }
+
+    private Channel channel;
+
     private final URI uri;
     private final ConcurrentMap<UUID, ResultQueue> pending = new ConcurrentHashMap<>();
     private final Cluster cluster;
@@ -76,7 +88,6 @@ final class Connection {
      * busy a particular {@code Connection} is.
      */
     public final AtomicInteger borrowed = new AtomicInteger(0);
-    private final AtomicReference<Class<Channelizer>> channelizerClass = new AtomicReference<>(null);
 
     private final int maxInProcess;
 
@@ -88,7 +99,7 @@ final class Connection {
     private final AtomicBoolean shutdownInitiated = new AtomicBoolean(false);
     private final AtomicReference<ScheduledFuture> keepAliveFuture = new AtomicReference<>();
 
-    public Connection(final URI uri, final ConnectionPool pool, final int maxInProcess) throws ConnectionException {
+    public Connection(final URI uri, final ConnectionPool pool, final int maxInProcess, CompletableFuture<Connection> connectionFuture) {
         this.uri = uri;
         this.cluster = pool.getCluster();
         this.client = pool.getClient();
@@ -98,27 +109,35 @@ final class Connection {
 
         connectionLabel = String.format("Connection{host=%s}", pool.host);
 
-        if (cluster.isClosing()) throw new IllegalStateException("Cannot open a connection with the cluster after close() is called");
-
         final Bootstrap b = this.cluster.getFactory().createBootstrap();
+        b.option(ChannelOption.CONNECT_TIMEOUT_MILLIS, cluster.connectionPoolSettings().maxWaitForConnection);
+        channelizer = buildChannelizer(cluster.connectionPoolSettings().channelizer);
+        channelizer.init(this);
+        b.channel(NioSocketChannel.class).handler(channelizer);
+
+        FutureUtils.toCompletableFuture(b.connect(uri.getHost(), uri.getPort()))
+                .thenCompose(channel -> {
+                    logger.info("Created new connection for {}", uri);
+                    this.channel = channel;
+                    return channelizer.connected();
+                })
+                .whenComplete((ok, err) -> {
+                    if (err == null) {
+                        scheduleKeepAlive();
+                        connectionFuture.complete(this);
+                    } else {
+                        logger.debug("Error opening connection on {}", uri);
+                        connectionFuture.completeExceptionally(err);
+                        closeAsync();
+                    }
+                });
+    }
+
+    private Channelizer buildChannelizer(String channelizerClassName) {
         try {
-            if (channelizerClass.get() == null) {
-                channelizerClass.compareAndSet(null, (Class<Channelizer>) Class.forName(cluster.connectionPoolSettings().channelizer));
-            }
-
-            channelizer = channelizerClass.get().newInstance();
-            channelizer.init(this);
-            b.channel(NioSocketChannel.class).handler(channelizer);
-
-            channel = b.connect(uri.getHost(), uri.getPort()).sync().channel();
-            channelizer.connected();
-
-            logger.info("Created new connection for {}", uri);
-
-            scheduleKeepAlive();
-        } catch (Exception ie) {
-            logger.debug("Error opening connection on {}", uri);
-            throw new ConnectionException(uri, "Could not open connection", ie);
+            return (Channelizer) Class.forName(channelizerClassName).newInstance();
+        } catch (Exception ex) {
+            return ExceptionUtils.rethrow(ex);
         }
     }
 
@@ -285,11 +304,7 @@ final class Connection {
     }
 
     private void handleConnectionCleanupOnError(final Connection thisConnection, final Throwable t) {
-        if (thisConnection.isDead()) {
-            if (pool != null) pool.replaceConnection(thisConnection);
-        } else {
-            thisConnection.returnToPool();
-        }
+        thisConnection.returnToPool();
     }
 
     private boolean isOkToClose() {

@@ -55,21 +55,6 @@ limitations under the License.
             <artifactId>log4j</artifactId>
             <optional>true</optional>
         </dependency>
-        <!-- METRICS -->
-        <dependency>
-            <groupId>com.codahale.metrics</groupId>
-            <artifactId>metrics-core</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>com.codahale.metrics</groupId>
-            <artifactId>metrics-graphite</artifactId>
-            <optional>true</optional>
-        </dependency>
-        <dependency>
-            <groupId>com.codahale.metrics</groupId>
-            <artifactId>metrics-ganglia</artifactId>
-            <optional>true</optional>
-        </dependency>
         <!-- TESTING -->
         <dependency>
             <groupId>org.apache.tinkerpop</groupId>

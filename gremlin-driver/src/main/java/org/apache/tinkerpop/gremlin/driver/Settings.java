@@ -221,11 +221,11 @@ final class Settings {
             if (connectionPoolConf.containsKey("maxSize"))
                 cpSettings.maxSize = connectionPoolConf.getInt("maxSize");
 
-            if (connectionPoolConf.containsKey("minSimultaneousUsagePerConnection"))
-                cpSettings.minSimultaneousUsagePerConnection = connectionPoolConf.getInt("minSimultaneousUsagePerConnection");
+            if (connectionPoolConf.containsKey("lowWatermark"))
+                cpSettings.lowWatermark = connectionPoolConf.getInt("lowWatermark");
 
-            if (connectionPoolConf.containsKey("maxSimultaneousUsagePerConnection"))
-                cpSettings.maxSimultaneousUsagePerConnection = connectionPoolConf.getInt("maxSimultaneousUsagePerConnection");
+            if (connectionPoolConf.containsKey("highWatermark"))
+                cpSettings.highWatermark = connectionPoolConf.getInt("highWatermark");
 
             if (connectionPoolConf.containsKey("maxInProcessPerConnection"))
                 cpSettings.maxInProcessPerConnection = connectionPoolConf.getInt("maxInProcessPerConnection");
@@ -373,13 +373,13 @@ final class Settings {
          * A connection under low use can be destroyed. This setting determines the threshold for determining when
          * that connection can be released and is defaulted to 8.
          */
-        public int minSimultaneousUsagePerConnection = ConnectionPool.MIN_SIMULTANEOUS_USAGE_PER_CONNECTION;
+        public int lowWatermark = ConnectionPool.LOW_WATERMARK;
 
         /**
          * If a connection is over used, then it might mean that is necessary to expand the pool by adding a new
          * connection.  This setting determines the threshold for a connections over use and is defaulted to 16
          */
-        public int maxSimultaneousUsagePerConnection = ConnectionPool.MAX_SIMULTANEOUS_USAGE_PER_CONNECTION;
+        public int highWatermark = ConnectionPool.HIGH_WATERMARK;
 
         /**
          * The maximum number of requests in flight on a connection where the default is 4.

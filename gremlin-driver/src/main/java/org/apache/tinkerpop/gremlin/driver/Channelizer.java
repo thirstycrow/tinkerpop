@@ -38,9 +38,11 @@ import io.netty.handler.codec.http.websocketx.WebSocketClientHandshakerFactory;
 import io.netty.handler.codec.http.websocketx.WebSocketVersion;
 import io.netty.handler.ssl.SslContext;
 import org.apache.tinkerpop.gremlin.driver.simple.WebSocketClient;
+import org.apache.tinkerpop.gremlin.driver.util.FutureUtils;
 
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
 
@@ -84,7 +86,8 @@ public interface Channelizer extends ChannelHandler {
      * Called after the channel connects. The {@code Channelizer} may need to perform some functions, such as a
      * handshake.
      */
-    public default void connected() {
+    public default CompletableFuture<Channel> connected() {
+        return CompletableFuture.completedFuture(null);
     }
 
     /**
@@ -211,16 +214,8 @@ public interface Channelizer extends ChannelHandler {
         }
 
         @Override
-        public void connected() {
-            try {
-                // block for a few seconds - if the handshake takes longer than there's gotta be issues with that
-                // server. more than likely, SSL is enabled on the server, but the client forgot to enable it or
-                // perhaps the server is not configured for websockets.
-                handler.handshakeFuture().get(15000, TimeUnit.MILLISECONDS);
-            } catch (Exception ex) {
-                throw new RuntimeException(new ConnectionException(connection.getUri(),
-                        "Could not complete websocket handshake - ensure that client protocol matches server", ex));
-            }
+        public CompletableFuture<Channel> connected() {
+            return FutureUtils.toCompletableFuture(handler.handshakeFuture());
         }
     }
 

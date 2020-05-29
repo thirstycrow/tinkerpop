@@ -204,8 +204,8 @@ public final class Cluster {
                 .maxWaitForConnection(settings.connectionPool.maxWaitForConnection)
                 .maxInProcessPerConnection(settings.connectionPool.maxInProcessPerConnection)
                 .minInProcessPerConnection(settings.connectionPool.minInProcessPerConnection)
-                .maxSimultaneousUsagePerConnection(settings.connectionPool.maxSimultaneousUsagePerConnection)
-                .minSimultaneousUsagePerConnection(settings.connectionPool.minSimultaneousUsagePerConnection)
+                .highWatermark(settings.connectionPool.highWatermark)
+                .lowWatermark(settings.connectionPool.lowWatermark)
                 .maxConnectionPoolSize(settings.connectionPool.maxSize)
                 .minConnectionPoolSize(settings.connectionPool.minSize)
                 .validationRequest(settings.connectionPool.validationRequest);
@@ -355,18 +355,11 @@ public final class Cluster {
     }
 
     /**
-     * Gets the maximum number of times that a {@link Connection} can be borrowed from the pool simultaneously.
-     */
-    public int maxSimultaneousUsagePerConnection() {
-        return manager.connectionPoolSettings.maxSimultaneousUsagePerConnection;
-    }
-
-    /**
      * Gets the minimum number of times that a {@link Connection} should be borrowed from the pool before it falls
      * under consideration for closing.
      */
-    public int minSimultaneousUsagePerConnection() {
-        return manager.connectionPoolSettings.minSimultaneousUsagePerConnection;
+    public int lowWatermark() {
+        return manager.connectionPoolSettings.lowWatermark;
     }
 
     /**
@@ -581,8 +574,8 @@ public final class Cluster {
         private int workerPoolSize = Runtime.getRuntime().availableProcessors() * 2;
         private int minConnectionPoolSize = ConnectionPool.MIN_POOL_SIZE;
         private int maxConnectionPoolSize = ConnectionPool.MAX_POOL_SIZE;
-        private int minSimultaneousUsagePerConnection = ConnectionPool.MIN_SIMULTANEOUS_USAGE_PER_CONNECTION;
-        private int maxSimultaneousUsagePerConnection = ConnectionPool.MAX_SIMULTANEOUS_USAGE_PER_CONNECTION;
+        private int lowWatermark = ConnectionPool.LOW_WATERMARK;
+        private int highWatermark = ConnectionPool.HIGH_WATERMARK;
         private int maxInProcessPerConnection = Connection.MAX_IN_PROCESS;
         private int minInProcessPerConnection = Connection.MIN_IN_PROCESS;
         private int maxWaitForConnection = Connection.MAX_WAIT_FOR_CONNECTION;
@@ -832,7 +825,7 @@ public final class Cluster {
         /**
          * The maximum number of in-flight requests that can occur on a {@link Connection}. This represents an
          * indication of how busy a {@link Connection} is allowed to be.  This number is linked to the
-         * {@link #maxSimultaneousUsagePerConnection} setting, but is slightly different in that it refers to
+         * {@link #highWatermark} setting, but is slightly different in that it refers to
          * the total number of requests on a {@link Connection}.  In other words, a {@link Connection} might
          * be borrowed once to have multiple requests executed against it.  This number controls the maximum
          * number of requests whereas {@link #maxInProcessPerConnection} controls the times borrowed.
@@ -843,27 +836,20 @@ public final class Cluster {
         }
 
         /**
-         * The maximum number of times that a {@link Connection} can be borrowed from the pool simultaneously.
-         * This represents an indication of how busy a {@link Connection} is allowed to be.  Set too large and the
-         * {@link Connection} may queue requests too quickly, rather than wait for an available {@link Connection}
-         * or create a fresh one.  If set too small, the {@link Connection} will show as busy very quickly thus
-         * forcing waits for available {@link Connection} instances in the pool when there is more capacity available.
+         * High watermark for the borrow request waiting queue. When the EWMA of the queue length is above this
+         * value, the connection pool will try to create a new connection.
          */
-        public Builder maxSimultaneousUsagePerConnection(final int maxSimultaneousUsagePerConnection) {
-            this.maxSimultaneousUsagePerConnection = maxSimultaneousUsagePerConnection;
+        public Builder highWatermark(final int highWatermark) {
+            this.highWatermark = highWatermark;
             return this;
         }
 
         /**
-         * The minimum number of times that a {@link Connection} should be borrowed from the pool before it falls
-         * under consideration for closing.  If a {@link Connection} is not busy and the
-         * {@link #minConnectionPoolSize} is exceeded, then there is no reason to keep that connection open.  Set
-         * too large and {@link Connection} that isn't busy will continue to consume resources when it is not being
-         * used.  Set too small and {@link Connection} instances will be destroyed when the driver might still be
-         * busy.
+         * Low watermark for the borrow request waiting queue. When the EWMA of the queue length is below this
+         * value, the connection pool will try to close a connection.
          */
-        public Builder minSimultaneousUsagePerConnection(final int minSimultaneousUsagePerConnection) {
-            this.minSimultaneousUsagePerConnection = minSimultaneousUsagePerConnection;
+        public Builder lowWatermark(final int lowWatermark) {
+            this.lowWatermark = lowWatermark;
             return this;
         }
 
@@ -1109,8 +1095,8 @@ public final class Cluster {
             connectionPoolSettings = new Settings.ConnectionPoolSettings();
             connectionPoolSettings.maxInProcessPerConnection = builder.maxInProcessPerConnection;
             connectionPoolSettings.minInProcessPerConnection = builder.minInProcessPerConnection;
-            connectionPoolSettings.maxSimultaneousUsagePerConnection = builder.maxSimultaneousUsagePerConnection;
-            connectionPoolSettings.minSimultaneousUsagePerConnection = builder.minSimultaneousUsagePerConnection;
+            connectionPoolSettings.highWatermark = builder.highWatermark;
+            connectionPoolSettings.lowWatermark = builder.lowWatermark;
             connectionPoolSettings.maxSize = builder.maxConnectionPoolSize;
             connectionPoolSettings.minSize = builder.minConnectionPoolSize;
             connectionPoolSettings.maxWaitForConnection = builder.maxWaitForConnection;
@@ -1164,14 +1150,14 @@ public final class Cluster {
             if (builder.minInProcessPerConnection > builder.maxInProcessPerConnection)
                 throw new IllegalArgumentException("maxInProcessPerConnection cannot be less than minInProcessPerConnection");
 
-            if (builder.minSimultaneousUsagePerConnection < 0)
-                throw new IllegalArgumentException("minSimultaneousUsagePerConnection must be greater than or equal to zero");
+            if (builder.lowWatermark < 0)
+                throw new IllegalArgumentException("lowWatermark must be greater than or equal to zero");
 
-            if (builder.maxSimultaneousUsagePerConnection < 1)
-                throw new IllegalArgumentException("maxSimultaneousUsagePerConnection must be greater than zero");
+            if (builder.highWatermark < 1)
+                throw new IllegalArgumentException("highWatermark must be greater than zero");
 
-            if (builder.minSimultaneousUsagePerConnection > builder.maxSimultaneousUsagePerConnection)
-                throw new IllegalArgumentException("maxSimultaneousUsagePerConnection cannot be less than minSimultaneousUsagePerConnection");
+            if (builder.lowWatermark > builder.highWatermark)
+                throw new IllegalArgumentException("highWatermark cannot be less than lowWatermark");
 
             if (builder.minConnectionPoolSize < 0)
                 throw new IllegalArgumentException("minConnectionPoolSize must be greater than or equal to zero");

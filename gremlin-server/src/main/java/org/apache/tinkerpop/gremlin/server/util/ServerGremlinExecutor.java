@@ -26,6 +26,7 @@ import org.apache.tinkerpop.gremlin.server.GraphManager;
 import org.apache.tinkerpop.gremlin.server.GremlinServer;
 import org.apache.tinkerpop.gremlin.server.Settings;
 import org.apache.tinkerpop.gremlin.structure.Graph;
+import org.apache.tinkerpop.gremlin.util.MetricManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -170,7 +171,7 @@ public class ServerGremlinExecutor {
 
     private void registerMetrics(final String engineName) {
         final GremlinScriptEngine engine = gremlinExecutor.getScriptEngineManager().getEngineByName(engineName);
-        MetricManager.INSTANCE.registerGremlinScriptEngineMetrics(engine, engineName, "sessionless", "class-cache");
+        GremlinServerMetrics.registerGremlinScriptEngineMetrics(engine, engineName, "sessionless", "class-cache");
     }
 
     public void addHostOption(final String key, final Object value) {

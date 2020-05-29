@@ -62,8 +62,8 @@ public class SettingsTest {
         conf.setProperty("connectionPool.sslSkipCertValidation", true);
         conf.setProperty("connectionPool.minSize", 100);
         conf.setProperty("connectionPool.maxSize", 200);
-        conf.setProperty("connectionPool.minSimultaneousUsagePerConnection", 300);
-        conf.setProperty("connectionPool.maxSimultaneousUsagePerConnection", 400);
+        conf.setProperty("connectionPool.lowWatermark", 300);
+        conf.setProperty("connectionPool.highWatermark", 400);
         conf.setProperty("connectionPool.maxInProcessPerConnection", 500);
         conf.setProperty("connectionPool.minInProcessPerConnection", 600);
         conf.setProperty("connectionPool.maxWaitForConnection", 700);
@@ -101,8 +101,8 @@ public class SettingsTest {
         assertThat(settings.connectionPool.sslSkipCertValidation, is(true));
         assertEquals(100, settings.connectionPool.minSize);
         assertEquals(200, settings.connectionPool.maxSize);
-        assertEquals(300, settings.connectionPool.minSimultaneousUsagePerConnection);
-        assertEquals(400, settings.connectionPool.maxSimultaneousUsagePerConnection);
+        assertEquals(300, settings.connectionPool.lowWatermark);
+        assertEquals(400, settings.connectionPool.highWatermark);
         assertEquals(500, settings.connectionPool.maxInProcessPerConnection);
         assertEquals(600, settings.connectionPool.minInProcessPerConnection);
         assertEquals(700, settings.connectionPool.maxWaitForConnection);

@@ -16,27 +16,13 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-package org.apache.tinkerpop.gremlin.server.util;
+package org.apache.tinkerpop.gremlin.util;
 
-import com.codahale.metrics.ConsoleReporter;
-import com.codahale.metrics.Counter;
-import com.codahale.metrics.CsvReporter;
-import com.codahale.metrics.Gauge;
-import com.codahale.metrics.Histogram;
-import com.codahale.metrics.JmxReporter;
-import com.codahale.metrics.Meter;
-import com.codahale.metrics.MetricFilter;
-import com.codahale.metrics.MetricRegistry;
-import com.codahale.metrics.Slf4jReporter;
-import com.codahale.metrics.Timer;
+import com.codahale.metrics.*;
 import com.codahale.metrics.ganglia.GangliaReporter;
 import com.codahale.metrics.graphite.Graphite;
 import com.codahale.metrics.graphite.GraphiteReporter;
 import info.ganglia.gmetric4j.gmetric.GMetric;
-import org.apache.commons.lang3.ArrayUtils;
-import org.apache.tinkerpop.gremlin.groovy.jsr223.GremlinGroovyScriptEngine;
-import org.apache.tinkerpop.gremlin.jsr223.GremlinScriptEngine;
-import org.apache.tinkerpop.gremlin.server.GremlinServer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -50,12 +36,6 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
-/**
- * Singleton that contains and configures Gremlin Server's {@code MetricRegistry}. Borrowed from Titan's approach to
- * managing Metrics.
- *
- * @author Stephen Mallette (http://stephen.genoprime.com)
- */
 public enum MetricManager {
     INSTANCE;
 
@@ -430,64 +410,5 @@ public enum MetricManager {
 
     public Histogram getHistogram(final String prefix, final String... names) {
         return getRegistry().histogram(MetricRegistry.name(prefix, names));
-    }
-
-    /**
-     * Registers metrics from a {@link GremlinScriptEngine}. At this point, this only works for the
-     * {@link GremlinGroovyScriptEngine} as it is the only one that collects metrics at this point. As the
-     * {@link GremlinScriptEngine} implementations achieve greater parity these metrics will get expanded.
-     */
-    public void registerGremlinScriptEngineMetrics(final GremlinScriptEngine engine, final String... prefix) {
-        // only register if metrics aren't already registered. typically only happens in testing where two gremlin
-        // server instances are running in the same jvm. they will share the same metrics if that is the case since
-        // the MetricsManager is static
-        if (engine instanceof GremlinGroovyScriptEngine && getRegistry().getNames().stream().noneMatch(n -> n.endsWith("long-run-compilation-count"))) {
-            final GremlinGroovyScriptEngine gremlinGroovyScriptEngine = (GremlinGroovyScriptEngine) engine;
-            getRegistry().register(
-                    MetricRegistry.name(GremlinServer.class, ArrayUtils.add(prefix, "long-run-compilation-count")),
-                    (Gauge<Long>) gremlinGroovyScriptEngine::getClassCacheLongRunCompilationCount);
-            getRegistry().register(
-                    MetricRegistry.name(GremlinServer.class, ArrayUtils.add(prefix, "estimated-size")),
-                    (Gauge<Long>) gremlinGroovyScriptEngine::getClassCacheEstimatedSize);
-            getRegistry().register(
-                    MetricRegistry.name(GremlinServer.class, ArrayUtils.add(prefix, "average-load-penalty")),
-                    (Gauge<Double>) gremlinGroovyScriptEngine::getClassCacheAverageLoadPenalty);
-            getRegistry().register(
-                    MetricRegistry.name(GremlinServer.class, ArrayUtils.add(prefix, "eviction-count")),
-                    (Gauge<Long>) gremlinGroovyScriptEngine::getClassCacheEvictionCount);
-            getRegistry().register(
-                    MetricRegistry.name(GremlinServer.class, ArrayUtils.add(prefix, "eviction-weight")),
-                    (Gauge<Long>) gremlinGroovyScriptEngine::getClassCacheEvictionWeight);
-            getRegistry().register(
-                    MetricRegistry.name(GremlinServer.class, ArrayUtils.add(prefix, "hit-count")),
-                    (Gauge<Long>) gremlinGroovyScriptEngine::getClassCacheHitCount);
-            getRegistry().register(
-                    MetricRegistry.name(GremlinServer.class, ArrayUtils.add(prefix, "hit-rate")),
-                    (Gauge<Double>) gremlinGroovyScriptEngine::getClassCacheHitRate);
-            getRegistry().register(
-                    MetricRegistry.name(GremlinServer.class, ArrayUtils.add(prefix, "load-count")),
-                    (Gauge<Long>) gremlinGroovyScriptEngine::getClassCacheLoadCount);
-            getRegistry().register(
-                    MetricRegistry.name(GremlinServer.class, ArrayUtils.add(prefix, "load-failure-count")),
-                    (Gauge<Long>) gremlinGroovyScriptEngine::getClassCacheLoadFailureCount);
-            getRegistry().register(
-                    MetricRegistry.name(GremlinServer.class, ArrayUtils.add(prefix, "load-failure-rate")),
-                    (Gauge<Double>) gremlinGroovyScriptEngine::getClassCacheLoadFailureRate);
-            getRegistry().register(
-                    MetricRegistry.name(GremlinServer.class, ArrayUtils.add(prefix, "load-success-count")),
-                    (Gauge<Long>) gremlinGroovyScriptEngine::getClassCacheLoadSuccessCount);
-            getRegistry().register(
-                    MetricRegistry.name(GremlinServer.class, ArrayUtils.add(prefix, "miss-count")),
-                    (Gauge<Long>) gremlinGroovyScriptEngine::getClassCacheMissCount);
-            getRegistry().register(
-                    MetricRegistry.name(GremlinServer.class, ArrayUtils.add(prefix, "miss-rate")),
-                    (Gauge<Double>) gremlinGroovyScriptEngine::getClassCacheMissRate);
-            getRegistry().register(
-                    MetricRegistry.name(GremlinServer.class, ArrayUtils.add(prefix, "request-count")),
-                    (Gauge<Long>) gremlinGroovyScriptEngine::getClassCacheRequestCount);
-            getRegistry().register(
-                    MetricRegistry.name(GremlinServer.class, ArrayUtils.add(prefix, "total-load-time")),
-                    (Gauge<Long>) gremlinGroovyScriptEngine::getClassCacheTotalLoadTime);
-        }
     }
 }

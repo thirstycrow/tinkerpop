@@ -18,24 +18,20 @@
  */
 package org.apache.tinkerpop.gremlin.driver;
 
+import com.codahale.metrics.*;
 import org.apache.tinkerpop.gremlin.driver.exception.ConnectionException;
-import org.apache.tinkerpop.gremlin.driver.message.RequestMessage;
-import org.apache.tinkerpop.gremlin.util.TimeUtil;
+import org.apache.tinkerpop.gremlin.driver.exception.HostUnavailableException;
+import org.apache.tinkerpop.gremlin.util.MetricManager;
+import org.apache.tinkerpop.gremlin.util.EWMA;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.CopyOnWriteArraySet;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -45,31 +41,28 @@ import java.util.concurrent.locks.ReentrantLock;
 final class ConnectionPool {
     private static final Logger logger = LoggerFactory.getLogger(ConnectionPool.class);
 
+    public static final int MAX_WAITERS = 100;
     public static final int MIN_POOL_SIZE = 2;
     public static final int MAX_POOL_SIZE = 8;
-    public static final int MIN_SIMULTANEOUS_USAGE_PER_CONNECTION = 8;
-    public static final int MAX_SIMULTANEOUS_USAGE_PER_CONNECTION = 16;
+    public static final int LOW_WATERMARK = 4;
+    public static final int HIGH_WATERMARK = 16;
 
     public final Host host;
     private final Cluster cluster;
     private final Client client;
     private final List<Connection> connections;
-    private final AtomicInteger open;
     private final Set<Connection> bin = new CopyOnWriteArraySet<>();
     private final int minPoolSize;
     private final int maxPoolSize;
-    private final int minSimultaneousUsagePerConnection;
-    private final int maxSimultaneousUsagePerConnection;
-    private final int minInProcess;
+    private final int lowWatermark;
+    private final int highWatermark;
     private final String poolLabel;
-
-    private final AtomicInteger scheduledForCreation = new AtomicInteger();
 
     private final AtomicReference<CompletableFuture<Void>> closeFuture = new AtomicReference<>();
 
-    private volatile int waiter = 0;
-    private final Lock waitLock = new ReentrantLock(true);
-    private final Condition hasAvailableConnection = waitLock.newCondition();
+    private final Connector connector = new Connector();
+    private final Lender lender = new Lender(MAX_WAITERS);
+    private final Metrics metrics = new Metrics();
 
     public ConnectionPool(final Host host, final Client client) {
         this(host, client, Optional.empty(), Optional.empty());
@@ -85,23 +78,11 @@ final class ConnectionPool {
         final Settings.ConnectionPoolSettings settings = settings();
         this.minPoolSize = overrideMinPoolSize.orElse(settings.minSize);
         this.maxPoolSize = overrideMaxPoolSize.orElse(settings.maxSize);
-        this.minSimultaneousUsagePerConnection = settings.minSimultaneousUsagePerConnection;
-        this.maxSimultaneousUsagePerConnection = settings.maxSimultaneousUsagePerConnection;
-        this.minInProcess = settings.minInProcessPerConnection;
+        this.lowWatermark = settings.lowWatermark;
+        this.highWatermark = settings.highWatermark;
 
         this.connections = new CopyOnWriteArrayList<>();
-
-        try {
-            for (int i = 0; i < minPoolSize; i++)
-                this.connections.add(new Connection(host.getHostUri(), this, settings.maxInProcessPerConnection));
-        } catch (ConnectionException ce) {
-            // ok if we don't get it initialized here - when a request is attempted in a connection from the
-            // pool it will try to create new connections as needed.
-            logger.debug("Could not initialize connections in pool for {} - pool size at {}", host, this.connections.size());
-            considerHostUnavailable();
-        }
-
-        this.open = new AtomicInteger(connections.size());
+        connector.activate();
 
         logger.info("Opening connection pool on {} with core size of {}", host, minPoolSize);
     }
@@ -110,98 +91,22 @@ final class ConnectionPool {
         return cluster.connectionPoolSettings();
     }
 
-    public Connection borrowConnection(final long timeout, final TimeUnit unit) throws TimeoutException, ConnectionException {
-        logger.debug("Borrowing connection from pool on {} - timeout in {} {}", host, timeout, unit);
-
-        if (isClosed()) throw new ConnectionException(host.getHostUri(), host.getAddress(), "Pool is shutdown");
-
-        final Connection leastUsedConn = selectLeastUsed();
-
-        if (connections.isEmpty()) {
-            logger.debug("Tried to borrow connection but the pool was empty for {} - scheduling pool creation and waiting for connection", host);
-            for (int i = 0; i < minPoolSize; i++) {
-                // If many connections are borrowed at the same time there needs to be a check to make sure no
-                // additional ones get scheduled for creation
-                if (scheduledForCreation.get() < minPoolSize) {
-                    scheduledForCreation.incrementAndGet();
-                    newConnection();
-                }
-            }
-
-            return waitForConnection(timeout, unit);
-        }
-
-        if (null == leastUsedConn) {
-            if (isClosed())
-                throw new ConnectionException(host.getHostUri(), host.getAddress(), "Pool is shutdown");
-            logger.debug("Pool was initialized but a connection could not be selected earlier - waiting for connection on {}", host);
-            return waitForConnection(timeout, unit);
-        }
-
-        // if the number borrowed on the least used connection exceeds the max allowed and the pool size is
-        // not at maximum then consider opening a connection
-        final int currentPoolSize = connections.size();
-        if (leastUsedConn.borrowed.get() >= maxSimultaneousUsagePerConnection && currentPoolSize < maxPoolSize) {
-            if (logger.isDebugEnabled())
-                logger.debug("Least used {} on {} exceeds maxSimultaneousUsagePerConnection but pool size {} < maxPoolSize - consider new connection",
-                        leastUsedConn.getConnectionInfo(), host, currentPoolSize);
-            considerNewConnection();
-        }
-
-        while (true) {
-            final int borrowed = leastUsedConn.borrowed.get();
-            final int availableInProcess = leastUsedConn.availableInProcess();
-
-            if (borrowed >= maxSimultaneousUsagePerConnection && leastUsedConn.availableInProcess() == 0) {
-                logger.debug("Least used connection selected from pool for {} but borrowed [{}] >= availableInProcess [{}] - wait",
-                        host, borrowed, availableInProcess);
-                return waitForConnection(timeout, unit);
-            }
-
-            if (leastUsedConn.borrowed.compareAndSet(borrowed, borrowed + 1)) {
-                if (logger.isDebugEnabled())
-                    logger.debug("Return least used {} on {}", leastUsedConn.getConnectionInfo(), host);
-                return leastUsedConn;
-            }
-        }
+    public CompletableFuture<Connection> borrowConnection(final long deadline) {
+        BorrowRequest request = new BorrowRequest(deadline);
+        lender.borrow(request);
+        return request.future;
     }
 
     public void returnConnection(final Connection connection) throws ConnectionException {
         logger.debug("Attempting to return {} on {}", connection, host);
+        metrics.returnedTotal.inc();
         if (isClosed()) throw new ConnectionException(host.getHostUri(), host.getAddress(), "Pool is shutdown");
-
-        final int borrowed = connection.borrowed.decrementAndGet();
 
         if (connection.isDead()) {
             logger.debug("Marking {} as dead", this.host);
-            this.replaceConnection(connection);
-        } else {
-            if (bin.contains(connection) && borrowed == 0) {
-                logger.debug("{} is already in the bin and it has no inflight requests so it is safe to close", connection);
-                if (bin.remove(connection))
-                    connection.closeAsync();
-                return;
-            }
-
-            // destroy a connection that exceeds the minimum pool size - it does not have the right to live if it
-            // isn't busy. replace a connection that has a low available in process count which likely means that
-            // it's backing up with requests that might never have returned. consider the maxPoolSize in this condition
-            // because if it is equal to 1 (which it is for a session) then there is no need to replace the connection
-            // as it will be responsible for every single request. if neither of these scenarios are met then let the
-            // world know the connection is available.
-            final int poolSize = connections.size();
-            final int availableInProcess = connection.availableInProcess();
-            if (poolSize > minPoolSize && borrowed <= minSimultaneousUsagePerConnection) {
-                if (logger.isDebugEnabled())
-                    logger.debug("On {} pool size of {} > minPoolSize {} and borrowed of {} <= minSimultaneousUsagePerConnection {} so destroy {}",
-                            host, poolSize, minPoolSize, borrowed, minSimultaneousUsagePerConnection, connection.getConnectionInfo());
-                destroyConnection(connection);
-            } else if (availableInProcess < minInProcess && maxPoolSize > 1) {
-                if (logger.isDebugEnabled())
-                    logger.debug("On {} availableInProcess {} < minInProcess {} so replace {}", host, availableInProcess, minInProcess, connection.getConnectionInfo());
-                replaceConnection(connection);
-            } else
-                announceAvailableConnection();
+            connector.removeConnection(connection);
+        } else if (!connector.maybeDestroyConnection(connection)) {
+            lender.activate();
         }
     }
 
@@ -220,15 +125,20 @@ final class ConnectionPool {
     /**
      * Permanently kills the pool.
      */
-    public synchronized CompletableFuture<Void> closeAsync() {
-        if (closeFuture.get() != null) return closeFuture.get();
+    public CompletableFuture<Void> closeAsync() {
+        if (closeFuture.compareAndSet(null, new CompletableFuture<>())) {
+            lender.activate();
+            CompletableFuture.allOf(connections.stream()
+                    .map(this::closeConnectionAsync)
+                    .toArray(CompletableFuture[]::new)
+            ).whenComplete((r, e) -> closeFuture.get().complete(null));
+        }
+        return closeFuture.get();
+    }
 
-        logger.info("Signalled closing of connection pool on {} with core size of {}", host, minPoolSize);
-
-        announceAllAvailableConnection();
-        final CompletableFuture<Void> future = killAvailableConnections();
-        closeFuture.set(future);
-        return future;
+    private CompletableFuture<Void> closeConnectionAsync(Connection connection) {
+        metrics.disconnectedTotal.inc();
+        return connection.closeAsync();
     }
 
     /**
@@ -238,211 +148,12 @@ final class ConnectionPool {
         return bin.size();
     }
 
-    private CompletableFuture<Void> killAvailableConnections() {
-        final List<CompletableFuture<Void>> futures = new ArrayList<>(connections.size());
-        for (Connection connection : connections) {
-            final CompletableFuture<Void> future = connection.closeAsync();
-            future.thenRun(open::decrementAndGet);
-            futures.add(future);
-        }
-
-        return CompletableFuture.allOf(futures.toArray(new CompletableFuture[futures.size()]));
-    }
-
-    void replaceConnection(final Connection connection) {
-        logger.debug("Replace {}", connection);
-
-        considerNewConnection();
-        definitelyDestroyConnection(connection);
-    }
-
-    private void considerNewConnection() {
-        logger.debug("Considering new connection on {} where pool size is {}", host, connections.size());
-        while (true) {
-            int inCreation = scheduledForCreation.get();
-
-            logger.debug("There are {} connections scheduled for creation on {}", inCreation, host);
-
-            // don't create more than one at a time
-            if (inCreation >= 1)
-                return;
-            if (scheduledForCreation.compareAndSet(inCreation, inCreation + 1))
-                break;
-        }
-
-        newConnection();
-    }
-
-    private void newConnection() {
-        cluster.executor().submit(() -> {
-            addConnectionIfUnderMaximum();
-            scheduledForCreation.decrementAndGet();
-            return null;
-        });
-    }
-
-    private boolean addConnectionIfUnderMaximum() {
-        while (true) {
-            int opened = open.get();
-            if (opened >= maxPoolSize)
-                return false;
-
-            if (open.compareAndSet(opened, opened + 1))
-                break;
-        }
-
-        if (isClosed()) {
-            open.decrementAndGet();
-            return false;
-        }
-
-        try {
-            connections.add(new Connection(host.getHostUri(), this, settings().maxInProcessPerConnection));
-        } catch (ConnectionException ce) {
-            logger.debug("Connections were under max, but there was an error creating the connection.", ce);
-            open.decrementAndGet();
-            considerHostUnavailable();
-            return false;
-        }
-
-        announceAvailableConnection();
-        return true;
-    }
-
-    private boolean destroyConnection(final Connection connection) {
-        while (true) {
-            int opened = open.get();
-            if (opened <= minPoolSize)
-                return false;
-
-            if (open.compareAndSet(opened, opened - 1))
-                break;
-        }
-
-        definitelyDestroyConnection(connection);
-        return true;
-    }
-
-    private void definitelyDestroyConnection(final Connection connection) {
-        // only add to the bin for future removal if its not already there.
-        if (!bin.contains(connection) && !connection.isClosing()) {
-            bin.add(connection);
-            connections.remove(connection);
-            open.decrementAndGet();
-        }
-
-        // only close the connection for good once it is done being borrowed or when it is dead
-        if (connection.isDead() || connection.borrowed.get() == 0) {
-            if(bin.remove(connection)) {
-                connection.closeAsync();
-                logger.debug("{} destroyed", connection.getConnectionInfo());
-            }
-        }
-    }
-
-    private Connection waitForConnection(final long timeout, final TimeUnit unit) throws TimeoutException, ConnectionException {
-        long start = System.nanoTime();
-        long remaining = timeout;
-        long to = timeout;
-        do {
-            try {
-                awaitAvailableConnection(remaining, unit);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                to = 0;
-            }
-
-            if (isClosed())
-                throw new ConnectionException(host.getHostUri(), host.getAddress(), "Pool is shutdown");
-
-            final Connection leastUsed = selectLeastUsed();
-            if (leastUsed != null) {
-                while (true) {
-                    final int inFlight = leastUsed.borrowed.get();
-                    final int availableInProcess = leastUsed.availableInProcess();
-                    if (inFlight >= availableInProcess) {
-                        logger.debug("Least used {} on {} has requests borrowed [{}] >= availableInProcess [{}] - may timeout waiting for connection",
-                                leastUsed, host, inFlight, availableInProcess);
-                        break;
-                    }
-
-                    if (leastUsed.borrowed.compareAndSet(inFlight, inFlight + 1)) {
-                        if (logger.isDebugEnabled())
-                            logger.debug("Return least used {} on {} after waiting", leastUsed.getConnectionInfo(), host);
-                        return leastUsed;
-                    }
-                }
-            }
-
-            remaining = to - TimeUtil.timeSince(start, unit);
-            logger.debug("Continue to wait for connection on {} if {} > 0", host, remaining);
-        } while (remaining > 0);
-
-        logger.debug("Timed-out waiting for connection on {} - possibly unavailable", host);
-
-        // if we timeout borrowing a connection that might mean the host is dead (or the timeout was super short).
-        // either way supply a function to reconnect
-        this.considerHostUnavailable();
-
-        throw new TimeoutException("Timed-out waiting for connection on " + host + " - possibly unavailable");
-    }
-
-    public void considerHostUnavailable() {
-        // called when a connection is "dead" due to a non-recoverable error.
-        host.makeUnavailable(this::tryReconnect);
-
-        // if the host is unavailable then we should release the connections
-        connections.forEach(this::definitelyDestroyConnection);
-
-        // let the load-balancer know that the host is acting poorly
-        this.cluster.loadBalancingStrategy().onUnavailable(host);
-    }
-
-    /**
-     * Attempt to reconnect to the {@link Host} that was previously marked as unavailable.  This method gets called
-     * as part of a schedule in {@link Host} to periodically try to create working connections.
-     */
-    private boolean tryReconnect(final Host h) {
-        logger.debug("Trying to re-establish connection on {}", h);
-
-        Connection connection = null;
-        try {
-            connection = borrowConnection(cluster.connectionPoolSettings().maxWaitForConnection, TimeUnit.MILLISECONDS);
-            final RequestMessage ping = client.buildMessage(cluster.validationRequest()).create();
-            final CompletableFuture<ResultSet> f = new CompletableFuture<>();
-            connection.write(ping, f);
-            f.get().all().get();
-
-            // host is reconnected and a connection is now available
-            this.cluster.loadBalancingStrategy().onAvailable(h);
-            return true;
-        } catch (Exception ex) {
-            logger.debug("Failed reconnect attempt on {}", h);
-            if (connection != null) definitelyDestroyConnection(connection);
-            return false;
-        }
-    }
-
-    private void announceAvailableConnection() {
-        logger.debug("Announce connection available on {}", host);
-
-        if (waiter == 0)
-            return;
-
-        waitLock.lock();
-        try {
-            hasAvailableConnection.signal();
-        } finally {
-            waitLock.unlock();
-        }
-    }
-
     private Connection selectLeastUsed() {
         int minInFlight = Integer.MAX_VALUE;
         Connection leastBusy = null;
         for (Connection connection : connections) {
             final int inFlight = connection.borrowed.get();
-            if (!connection.isDead() && inFlight < minInFlight) {
+            if (!connection.isDead() && inFlight < minInFlight && connection.availableInProcess() > 0) {
                 minInFlight = inFlight;
                 leastBusy = connection;
             }
@@ -450,28 +161,20 @@ final class ConnectionPool {
         return leastBusy;
     }
 
-    private void awaitAvailableConnection(long timeout, TimeUnit unit) throws InterruptedException {
-        logger.debug("Wait {} {} for an available connection on {} with {}", timeout, unit, host, Thread.currentThread());
-
-        waitLock.lock();
-        waiter++;
-        try {
-            hasAvailableConnection.await(timeout, unit);
-        } finally {
-            waiter--;
-            waitLock.unlock();
-        }
+    private void makeAvailable() {
+        host.makeAvailable();
+        cluster.loadBalancingStrategy().onAvailable(host);
     }
 
-    private void announceAllAvailableConnection() {
-        if (waiter == 0)
-            return;
-
-        waitLock.lock();
-        try {
-            hasAvailableConnection.signalAll();
-        } finally {
-            waitLock.unlock();
+    private void maybeUnavailable() {
+        if (connections.size() == 0 && host.isAvailable()) {
+            host.makeUnavailable();
+            cluster.loadBalancingStrategy().onUnavailable(host);
+            cluster.executor().schedule(
+                    () -> connector.activate(),
+                    cluster.connectionPoolSettings().reconnectInterval,
+                    TimeUnit.MILLISECONDS);
+            lender.activate();
         }
     }
 
@@ -489,5 +192,211 @@ final class ConnectionPool {
     @Override
     public String toString() {
         return poolLabel;
+    }
+
+    private class BorrowRequest {
+        final long deadline;
+        final long start = System.nanoTime();
+        private final CompletableFuture<Connection> future = new CompletableFuture();
+
+        BorrowRequest(long deadline) {
+            this.deadline = deadline;
+            metrics.borrowsTotal.inc();
+        }
+
+        public void complete(Connection connection) {
+            if (future.complete(connection)) {
+                metrics.borrowedTotal.inc();
+                metrics.waitingTime.update(System.nanoTime() - start, TimeUnit.NANOSECONDS);
+            }
+        }
+
+        public void fail(Throwable cause) {
+            if (future.completeExceptionally(cause)) {
+                metrics.borrowFailuresTotal.inc();
+                metrics.waitingTime.update(System.nanoTime() - start, TimeUnit.NANOSECONDS);
+            }
+        }
+    }
+
+    private abstract class AtMostOneWorker {
+
+        private final Lock lock = new ReentrantLock();
+
+        public abstract boolean maybeHasWork();
+
+        public abstract boolean doWork();
+
+        public final void activate() {
+            cluster.executor().submit(() -> {
+                while (maybeHasWork() && lock.tryLock()) {
+                    try {
+                        if (!doWork()) {
+                            break;
+                        }
+                    } finally {
+                        lock.unlock();
+                    }
+                }
+            });
+        }
+    }
+
+    private class Connector extends AtMostOneWorker {
+        private AtomicLong adjustTime = new AtomicLong(System.nanoTime());
+        private int targetPoolSize = minPoolSize;
+        private int open = 0;
+
+        void removeConnection(final Connection connection) {
+            if (connections.remove(connection)) {
+                open--;
+                bin.add(connection);
+                maybeUnavailable();
+                activate();
+            }
+            maybeDestroyConnection(connection);
+        }
+
+        boolean maybeDestroyConnection(final Connection connection) {
+            if (bin.contains(connection) && (connection.isDead() || connection.borrowed.get() == 0)) {
+                if (bin.remove(connection)) {
+                    closeConnectionAsync(connection);
+                    logger.debug("{} destroyed", connection.getConnectionInfo());
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        void maybeAdjustPoolSize() {
+            final long adjust = adjustTime.get();
+            final long now = System.nanoTime();
+            if (now > adjust && adjustTime.compareAndSet(adjust, now + TimeUnit.SECONDS.toNanos(1))) {
+                final double ewma = metrics.waitingQLength.get();
+                if (ewma < lowWatermark) {
+                    targetPoolSize = Math.max(minPoolSize, targetPoolSize - 1);
+                    activate();
+                } else if (ewma > highWatermark) {
+                    targetPoolSize = Math.min(maxPoolSize, targetPoolSize + 1);
+                    activate();
+                }
+            }
+        }
+
+        @Override
+        public boolean maybeHasWork() {
+            return open != targetPoolSize;
+        }
+
+        @Override
+        public boolean doWork() {
+            if (open < targetPoolSize) {
+                metrics.connectsTotal.inc();
+                open++;
+                Connection.open(host.getHostUri(), ConnectionPool.this, settings().maxInProcessPerConnection)
+                        .whenCompleteAsync((connection, error) -> {
+                            if (error == null) {
+                                metrics.connectedTotal.inc();
+                                connections.add(connection);
+                                makeAvailable();
+                                lender.activate();
+                            } else {
+                                metrics.connectionFailuresTotal.inc();
+                                open--;
+                                maybeUnavailable();
+                            }
+                        }, cluster.executor());
+            } else {
+                Connection leastUsed = selectLeastUsed();
+                if (leastUsed != null) {
+                    removeConnection(leastUsed);
+                }
+            }
+            return host.isAvailable();
+        }
+    }
+
+    private class Lender extends AtMostOneWorker {
+        private final BlockingQueue<BorrowRequest> waiters;
+
+        Lender(int maxWaiters) {
+            waiters = new ArrayBlockingQueue<>(maxWaiters);
+        }
+
+        void borrow(BorrowRequest request) {
+            if (waiters.offer(request)) {
+                metrics.waitingQLength.observe(waiters.size());
+                cluster.executor().submit(() -> activate());
+                connector.maybeAdjustPoolSize();
+            } else {
+                request.fail(new HostUnavailableException(host.getHostUri(), host.getAddress(), "Host is busy"));
+            }
+        }
+
+        @Override
+        public boolean maybeHasWork() {
+            return !waiters.isEmpty();
+        }
+
+        @Override
+        public boolean doWork() {
+            final BorrowRequest request = waiters.peek();
+            if (System.nanoTime() > request.deadline) {
+                request.fail(new ConnectionException(host.getHostUri(), host.getAddress(), "Timed out waiting for connection"));
+            } else if (isClosed()) {
+                request.fail(new ConnectionException(host.getHostUri(), host.getAddress(), "Pool is shutdown"));
+            } else if (!host.isAvailable()) {
+                request.fail(new HostUnavailableException(host.getHostUri(), host.getAddress(), "Host is unavailable"));
+            } else {
+                tryBorrowConnection(request);
+            }
+            boolean requestDone = request.future.isDone();
+            if (requestDone) {
+                waiters.poll();
+                metrics.waitingQLength.observe(waiters.size());
+                connector.maybeAdjustPoolSize();
+            }
+            return requestDone;
+        }
+
+        private void tryBorrowConnection(final BorrowRequest request) {
+            final Connection leastUsedConn = selectLeastUsed();
+
+            if (null == leastUsedConn) {
+                if (isClosed()) {
+                    request.fail(new ConnectionException(host.getHostUri(), host.getAddress(), "Pool is shutdown"));
+                    return;
+                }
+                logger.debug("Pool was initialized but a connection could not be selected earlier - waiting for connection on {}", host);
+                return;
+            }
+
+            if (logger.isDebugEnabled()) {
+                logger.debug("Return least used {} on {}", leastUsedConn.getConnectionInfo(), host);
+            }
+            leastUsedConn.borrowed.incrementAndGet();
+            request.complete(leastUsedConn);
+        }
+    }
+
+    private class Metrics {
+        final Counter connectsTotal = MetricManager.INSTANCE.getCounter(name("connects_total"));
+        final Counter connectedTotal = MetricManager.INSTANCE.getCounter(name("connected_total"));
+        final Counter disconnectedTotal = MetricManager.INSTANCE.getCounter(name("disconnected_total"));
+        final Counter connectionFailuresTotal = MetricManager.INSTANCE.getCounter(name("connection_failures_total"));
+        final Counter borrowsTotal = MetricManager.INSTANCE.getCounter(name("borrows_total"));
+        final Counter borrowedTotal = MetricManager.INSTANCE.getCounter(name("borrowed_total"));
+        final Counter borrowFailuresTotal = MetricManager.INSTANCE.getCounter(name("borrow_failures_total"));
+        final Counter returnedTotal = MetricManager.INSTANCE.getCounter(name("returned_total"));
+        final Timer waitingTime = MetricManager.INSTANCE.getTimer(name("waiting_for_connection"));
+        final EWMA waitingQLength = new EWMA(10, TimeUnit.SECONDS);
+
+        Metrics() {
+            MetricManager.INSTANCE.getRegistry().register(name("waiting_q_length"), (Gauge) waitingQLength::get);
+        }
+
+        private String name(String... names) {
+            return MetricRegistry.name(ConnectionPool.class, names);
+        }
     }
 }
